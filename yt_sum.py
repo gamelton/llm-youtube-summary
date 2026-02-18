@@ -1,60 +1,144 @@
 #!/usr/bin/env python3
 
-import os
-import json
-import requests
-import re
+## System packages: ffmpeg, ollama (separate server)
+## Python packages: yt-dlp[default,curl-cffi]
+## EJS: 
+### curl -fsSL https://deno.land/install.sh | sh
+### source ~/.bashrc
+### pip install -U "yt-dlp[default]" --break-system-packages
+# yt-dlp --skip-download --write-auto-sub --sub-lang ru --sub-format json3 -v "YOUR_VIDEO_URL"
+
+
 import yt_dlp
+import glob
+import json
+import time
+import re
+import os
+import requests
+import logging
 
-OLLAMA_URL = "http://192.168.3.14:11434/api/chat"
-YOUTUBE_URL = 'https://www.youtube.com/watch?v=umbtgR77mR8'
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
-for lang in ['ru', 'en']:
-    try:
-        YDL = yt_dlp.YoutubeDL({'skip_download': True, 'quiet': True, 'writesubtitles': True, 'writeautomaticsub': True, 'subtitlesformat': 'json3', 'subtitleslangs': [lang], 'outtmpl': {'default': 'temp_subtitles_%(id)s'}})
-        VIDEO_INFO = YDL.extract_info(YOUTUBE_URL, download=True)
-        VIDEO_NAME = VIDEO_INFO.get('title', 'Unknown')
-        VIDEO_ID = VIDEO_INFO.get('id', 'unknown')
-        break
-    except yt_dlp.utils.DownloadError:
-        continue
+# --- Configuration ---
+OLLAMA_URL = "http://localhost:11434/api/chat"
+OLLAMA_MODEL = "your-model-name"
+YOUTUBE_URL = "https://www.youtube.com/watch?v=REPLACE_ME"
 
-with open(f"temp_subtitles_{VIDEO_ID}.{lang}.json3", "r", encoding="utf-8") as f:
-    JSON_SUBTITLES = json.load(f)
+# --- Main logic ---
+url = YOUTUBE_URL
 
-SUBTITLE_TEXT = ""
-for event in JSON_SUBTITLES.get("events", []):
-    if "segs" in event:
-        for seg in event["segs"]:
-            text = seg.get("utf8", "")
-            if text != "\n":
-                SUBTITLE_TEXT += text
+if "youtube.com" not in url and "youtu.be" not in url:
+    raise ValueError("Please provide a valid YouTube URL.")
 
-os.remove(f"temp_subtitles_{VIDEO_ID}.{lang}.json3")
+video_id = None
+lang = None
+summary = None
 
-LLM_REQUEST = f"""
-Ты — инструмент извлечения фактической информации. 
-Тебе даны субтитры из видео: "{VIDEO_NAME}".
+try:
+    sub_json = None
 
-Твоя ЗАДАЧА:
-Извлечь строго и только ТО, что ПРЯМО и ЯВНО содержится в предоставленном тексте:
+    for lang in ['ru', 'en']:
+        try:
+            with yt_dlp.YoutubeDL({
+                'skip_download': True, 'quiet': True, 'writesubtitles': True,
+                'writeautomaticsub': True, 'subtitlesformat': 'json3', 'subtitleslangs': [lang],
+                'outtmpl': {'default': 'temp_subs_%(id)s', 'subtitle': 'temp_subs_%(id)s'}
+            }) as ydl:
+                info = ydl.extract_info(url, download=True)
+                video_id = info.get('id', 'unknown')
+                title = info.get('title', 'Unknown')
 
-— факты
-— утверждения
-— конкретные тезисы
-— имена, фамилии, названия
-— даты, временные указания
-— числовые данные
-— явно упомянутые объекты и события
+                matches = glob.glob(f"*{video_id}*.{lang}.json3")
+                logger.info("Looking for %s subtitles, found files: %s", lang, matches)
 
-Ответ строго на русском языке.
+                if matches:
+                    with open(matches[0], "r", encoding="utf-8") as f:
+                        sub_json = json.load(f)
+                    break
+        except yt_dlp.utils.DownloadError:
+            time.sleep(5)
+            continue
 
-Текст субтитров:
+    if not sub_json:
+        raise RuntimeError("No subtitles found in ru/en.")
 
-{SUBTITLE_TEXT}
-"""
+    print("Processing subtitles…")
+    lines, prev_end = [], 0
 
+    for ev in sub_json.get("events", []):
+        if "segs" not in ev:
+            continue
+        line = "".join(s.get("utf8", "") for s in ev["segs"]).strip()
+        if not line or line == "\n":
+            continue
+        if lines and line in " ".join(lines[-3:]):
+            continue
+        start = ev.get("tStartMs", 0)
+        dur = ev.get("dDurationMs", 0)
+        if lines and start - prev_end > 180_000:
+            lines.append("\n\n")
+        lines.append(line)
+        prev_end = start + dur
 
-JSON_REQUEST = {"model": "gemma3:4b", "stream": False, "messages": [{ "role": "user", "content": f"{LLM_REQUEST}" }], "options": { "num_ctx": 8192 }}
-response = requests.post(OLLAMA_URL, json=JSON_REQUEST, headers={"Content-Type": "application/json"})
-LLM_RESPONSE_CONTENT = response.json()["message"]["content"]
+    subtitle_text = " ".join(lines).replace("  ", " ").strip()
+
+    if not subtitle_text:
+        raise RuntimeError("Subtitles are empty after cleaning.")
+
+    token_est = len(subtitle_text) // 3
+    print(f"Sending to LLM (~{token_est} tokens)…")
+
+    system = (
+        "Ты — ассистент для создания структурированных конспектов видео из субтитров. "
+        "Исправляй ошибки распознавания речи. Отвечай строго на русском. "
+        "Не выдумывай то, чего нет в тексте. Пропускай рекламные вставки."
+    )
+    user_prompt = (
+        f'Видео: «{title}»\n\nСоставь структурированный конспект:\n'
+        f'## Краткое содержание\n(2-3 предложения)\n'
+        f'## Основные тезисы\n(нумерованный список)\n'
+        f'## Ключевые факты и данные\n(имена, даты, числа — только явно упомянутые)\n'
+        f'## Выводы автора\n(если есть)\n\nТекст субтитров:\n\n{subtitle_text}'
+    )
+
+    resp = requests.post(
+        OLLAMA_URL,
+        headers={"Content-Type": "application/json"},
+        json={
+            "model": OLLAMA_MODEL,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_prompt},
+            ],
+            "options": {
+                "num_ctx": max(32768, token_est + 4096),
+                "temperature": 0.3,
+            },
+        },
+    )
+    resp.raise_for_status()
+
+    summary = re.sub(
+        r"<think>.*?</think>\s*", "",
+        resp.json()["message"]["content"],
+        flags=re.DOTALL,
+    ).strip()
+
+    print(f"✅ Summary for: {title}\n")
+    print(summary)
+
+except requests.exceptions.Timeout:
+    print("❌ LLM request timed out.")
+except Exception as e:
+    logger.error("Error: %s", e, exc_info=True)
+    print(f"❌ Error: {e}")
+finally:
+    if video_id:
+        for f in glob.glob(f"*{video_id}*.json3"):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
